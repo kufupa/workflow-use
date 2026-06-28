@@ -35,7 +35,7 @@ export default defineBackground(() => {
   // Track recent user interactions to distinguish intentional vs side-effect navigation
   const recentUserInteractions: { [tabId: number]: number } = {}; // timestamp of last user interaction
 
-  let isRecordingEnabled = true; // Default to disabled (OFF)
+  let isRecordingEnabled = false;
   let lastWorkflowHash: string | null = null; // Cache for the last logged workflow hash
 
   const PYTHON_SERVER_ENDPOINT = "http://127.0.0.1:7331/event";
@@ -55,11 +55,18 @@ export default defineBackground(() => {
   // Helper function to send data to the Python server
   async function sendEventToServer(eventData: HttpEvent) {
     try {
-      await fetch(PYTHON_SERVER_ENDPOINT, {
+      const response = await fetch(PYTHON_SERVER_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(eventData),
       });
+      if (!response.ok) {
+        const body = await response.text();
+        console.error(
+          `Python server rejected ${eventData.type} (${response.status}):`,
+          body
+        );
+      }
     } catch (error) {
       console.warn(
         `Failed to send event to Python server at ${PYTHON_SERVER_ENDPOINT}:`,
@@ -89,7 +96,7 @@ export default defineBackground(() => {
   }
 
   // Function to broadcast workflow data updates to the console bus
-  async function broadcastWorkflowDataUpdate(): Promise<Workflow> {
+  async function broadcastWorkflowDataUpdate(options?: { forceSend?: boolean }): Promise<Workflow> {
     // console.log("[DEBUG] broadcastWorkflowDataUpdate: Entered function"); // Optional: Keep for debugging
     const allSteps: Step[] = Object.keys(sessionLogs)
       .flatMap((tabIdStr) => {
@@ -170,8 +177,12 @@ export default defineBackground(() => {
 
     // console.log("[DEBUG] broadcastWorkflowDataUpdate: Current steps hash:", currentWorkflowHash, "Last steps hash:", lastWorkflowHash); // Optional
 
-    // Condition to skip logging if the hash of steps is the same
-    if (lastWorkflowHash !== null && currentWorkflowHash === lastWorkflowHash) {
+    // Condition to skip logging if the hash of steps is the same (unless forced on stop)
+    if (
+      !options?.forceSend &&
+      lastWorkflowHash !== null &&
+      currentWorkflowHash === lastWorkflowHash
+    ) {
       // console.log("[DEBUG] broadcastWorkflowDataUpdate: Steps unchanged, skipping log."); // Optional
       return uiWorkflowData;
     }
@@ -185,7 +196,7 @@ export default defineBackground(() => {
       timestamp: Date.now(),
       payload: semanticWorkflowData, // Send semantic format to server
     };
-    sendEventToServer(eventToSend);
+    await sendEventToServer(eventToSend);
     return uiWorkflowData; // Return UI format to extension
   }
 
@@ -687,20 +698,25 @@ export default defineBackground(() => {
       sendResponse({ status: "started" }); // Send simple confirmation
     } else if (message.type === "STOP_RECORDING") {
       console.log("Received STOP_RECORDING request.");
-      if (isRecordingEnabled) {
-        isRecordingEnabled = false;
-        console.log("Recording status set to: false");
-        broadcastRecordingStatus(); // Inform content scripts and sidepanel
+      (async () => {
+        if (isRecordingEnabled) {
+          isRecordingEnabled = false;
+          console.log("Recording status set to: false");
+          broadcastRecordingStatus();
 
-        // Send recording stopped event to Python server
-        const eventToSend: HttpRecordingStoppedEvent = {
-          type: "RECORDING_STOPPED",
-          timestamp: Date.now(),
-          payload: { message: "Recording has stopped" },
-        };
-        sendEventToServer(eventToSend);
-      }
-      sendResponse({ status: "stopped" }); // Send simple confirmation
+          // Flush final workflow to Python before signaling stop
+          await broadcastWorkflowDataUpdate({ forceSend: true });
+
+          const eventToSend: HttpRecordingStoppedEvent = {
+            type: "RECORDING_STOPPED",
+            timestamp: Date.now(),
+            payload: { message: "Recording has stopped" },
+          };
+          await sendEventToServer(eventToSend);
+        }
+        sendResponse({ status: "stopped" });
+      })();
+      return true;
     }
     // --- Add Extraction Step from Sidepanel ---
     else if (message.type === "ADD_EXTRACTION_STEP") {

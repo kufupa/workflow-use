@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile  # For temporary file handling
 import webbrowser
 from pathlib import Path
@@ -10,6 +11,7 @@ import aiofiles
 import pandas as pd
 import typer
 from browser_use import Browser
+from browser_use.browser.profile import BrowserProfile
 from browser_use.llm import ChatBrowserUse
 from browser_use.llm.base import BaseChatModel
 
@@ -18,8 +20,37 @@ from workflow_use.controller.service import WorkflowController
 from workflow_use.healing.service import HealingService
 from workflow_use.mcp.service import get_mcp_server
 from workflow_use.recorder.service import RecordingService  # Added import
+from workflow_use.recorder.profile import get_recorder_user_data_dir, prepare_recorder_profile_dir
 from workflow_use.storage.service import WorkflowStorageService
 from workflow_use.workflow.service import Workflow
+
+
+def _pilot_browser_profile() -> BrowserProfile:
+	"""Shared headed profile for semantic conversion and replay (logins persist)."""
+	pilot_profile_dir = prepare_recorder_profile_dir(get_recorder_user_data_dir())
+	return BrowserProfile(
+		headless=False,
+		user_data_dir=str(pilot_profile_dir),
+		enable_default_extensions=False,
+		chromium_sandbox=sys.platform != 'linux',
+	)
+
+
+def _build_semantic_conversion_browser() -> Browser:
+	"""Browser for post-record semantic mapping — reuses pilot profile (logins persist)."""
+	return Browser(browser_profile=_pilot_browser_profile())
+
+
+async def _stop_browser(browser: Browser) -> None:
+	"""browser-use 0.9.x exposes stop(); newer builds also alias close()."""
+	stop = getattr(browser, 'stop', None)
+	if stop:
+		await stop()
+		return
+	close = getattr(browser, 'close', None)
+	if close:
+		await close()
+
 
 # Placeholder for recorder functionality
 # from src.recorder.service import RecorderService
@@ -410,14 +441,15 @@ async def _convert_recording_to_semantic_workflow(recording_data, description, s
 	# Initialize semantic extractor
 	semantic_extractor = SemanticExtractor()
 
-	# Start browser to process pages
-	browser = Browser()
+	# Start browser to process pages (must start session before get_current_page)
+	browser = _build_semantic_conversion_browser()
 
 	semantic_steps = []
 	current_url = None
 	semantic_mapping = {}
 
 	try:
+		await browser.start()
 		for i, step in enumerate(fixed_steps):
 			step_type = step.get('type', '').lower()
 
@@ -429,7 +461,7 @@ async def _convert_recording_to_semantic_workflow(recording_data, description, s
 
 					# Extract semantic mapping for this page
 					try:
-						page = await browser.get_current_page()
+						page = await browser.must_get_current_page()
 						await page.goto(current_url)
 						# Wait for page to load and dynamic content
 						await asyncio.sleep(2)
@@ -446,7 +478,7 @@ async def _convert_recording_to_semantic_workflow(recording_data, description, s
 				# This is especially important after form interactions that might show/hide elements
 				if i > 0 and current_url:  # Skip refresh for first step
 					try:
-						page = await browser.get_current_page()
+						page = await browser.must_get_current_page()
 						# Small delay to let any previous interactions take effect
 						await asyncio.sleep(1)
 						semantic_mapping = await semantic_extractor.extract_semantic_mapping(page)
@@ -479,7 +511,7 @@ async def _convert_recording_to_semantic_workflow(recording_data, description, s
 				# After scroll, refresh semantic mapping as new elements might be visible
 				if current_url:
 					try:
-						page = await browser.get_current_page()
+						page = await browser.must_get_current_page()
 						await page.evaluate(f'() => window.scrollBy({step.get("scrollX", 0)}, {step.get("scrollY", 0)})')
 						await asyncio.sleep(1)  # Wait for scroll to complete
 						semantic_mapping = await semantic_extractor.extract_semantic_mapping(page)
@@ -507,7 +539,7 @@ async def _convert_recording_to_semantic_workflow(recording_data, description, s
 				semantic_steps.append(step)
 
 	finally:
-		await browser.close()
+		await _stop_browser(browser)
 
 	# Build the semantic workflow
 	semantic_workflow = {
@@ -802,7 +834,7 @@ async def _simulate_step_interaction(step, browser):
 		return
 
 	try:
-		page = await browser.get_current_page()
+		page = await browser.must_get_current_page()
 
 		if step_type == 'click':
 			await page.click(css_selector, timeout=2000)
@@ -1356,8 +1388,17 @@ def run_workflow_no_ai_command(
 		typer.echo()  # Add space
 
 		try:
-			# Instantiate Browser for the Workflow instance
-			browser = Browser(use_cloud=use_cloud)
+			# Reuse pilot Chrome profile so logins from recording persist into replay.
+			pilot_profile_dir = get_recorder_user_data_dir()
+			pilot_profile_dir.mkdir(parents=True, exist_ok=True)
+			browser_profile = _pilot_browser_profile()
+			typer.echo(
+				typer.style(
+					f'Using pilot browser profile: {pilot_profile_dir}',
+					fg=typer.colors.CYAN,
+				)
+			)
+			browser = Browser(browser_profile=browser_profile, use_cloud=use_cloud)
 			# Create a dummy LLM instance since it's required by the constructor but won't be used for interactions
 			dummy_llm = None
 			extraction_llm = None
@@ -1540,15 +1581,13 @@ def generate_semantic_mapping_command(
 		typer.echo()
 
 		try:
-			from browser_use import Browser
-
 			from workflow_use.workflow.semantic_extractor import SemanticExtractor
 
-			browser = Browser()
+			browser = _build_semantic_conversion_browser()
 			extractor = SemanticExtractor()
 
 			await browser.start()
-			page = await browser.get_current_page()
+			page = await browser.must_get_current_page()
 			await page.goto(url)
 			await asyncio.sleep(2)  # Wait for page to load
 
@@ -1604,7 +1643,7 @@ def generate_semantic_mapping_command(
 
 				typer.secho(f'Semantic mapping saved to: {output_file}', fg=typer.colors.GREEN)
 
-			await browser.close()
+			await _stop_browser(browser)
 
 		except Exception as e:
 			typer.secho(f'Error generating semantic mapping: {e}', fg=typer.colors.RED)
@@ -1635,15 +1674,13 @@ def create_semantic_workflow_command(
 		typer.echo()
 
 		try:
-			from browser_use import Browser
-
 			from workflow_use.workflow.semantic_extractor import SemanticExtractor
 
-			browser = Browser()
+			browser = _build_semantic_conversion_browser()
 			extractor = SemanticExtractor()
 
 			await browser.start()
-			page = await browser.get_current_page()
+			page = await browser.must_get_current_page()
 			await page.goto(url)
 			await asyncio.sleep(2)  # Wait for page to load
 
@@ -1731,7 +1768,7 @@ def create_semantic_workflow_command(
 			typer.echo('3. Add input_schema for dynamic values')
 			typer.echo('4. Test with: python cli.py run-workflow-no-ai your_workflow.json')
 
-			await browser.close()
+			await _stop_browser(browser)
 
 		except Exception as e:
 			typer.secho(f'Error creating semantic workflow: {e}', fg=typer.colors.RED)

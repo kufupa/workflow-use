@@ -1,6 +1,6 @@
-from typing import Literal, Union
+from typing import Any, Literal, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from workflow_use.schema.views import WorkflowDefinitionSchema
 
@@ -9,6 +9,21 @@ from workflow_use.schema.views import WorkflowDefinitionSchema
 
 class RecordingStatusPayload(BaseModel):
 	message: str
+
+
+class RecordedWorkflowPayload(BaseModel):
+	"""Loose in-flight recording from the extension (before semantic build).
+
+	Unlike WorkflowDefinitionSchema, allows empty steps and no trailing extract step.
+	"""
+
+	workflow_analysis: str | None = None
+	name: str = 'Recorded Workflow (Semantic)'
+	description: str = ''
+	version: str = '1.0'
+	default_wait_time: float | None = 0.1
+	steps: list[dict[str, Any]] = Field(default_factory=list)
+	input_schema: list[Any] = Field(default_factory=list)
 
 
 # --- Main Event Models (mirroring HttpEvent types from message-bus-types.ts) ---
@@ -20,7 +35,7 @@ class BaseHttpEvent(BaseModel):
 
 class HttpWorkflowUpdateEvent(BaseHttpEvent):
 	type: Literal['WORKFLOW_UPDATE'] = 'WORKFLOW_UPDATE'
-	payload: WorkflowDefinitionSchema
+	payload: RecordedWorkflowPayload
 
 
 class HttpRecordingStartedEvent(BaseHttpEvent):
